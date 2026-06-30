@@ -58,13 +58,26 @@ public class HeapBufferedAsyncResponseConsumer extends AbstractAsyncResponseCons
     private final int bufferLimit;
 
     /**
-     * Creates a new instance of this consumer with the provided buffer limit.
+     * Creates a new instance of this consumer with the provided buffer limit and no shared memory budget.
      *
      * @param bufferLimit the buffer limit. Must be greater than 0.
      * @throws IllegalArgumentException if {@code bufferLimit} is less than or equal to 0.
      */
     public HeapBufferedAsyncResponseConsumer(int bufferLimit) {
         super(new HeapBufferedAsyncEntityConsumer(bufferLimit));
+        this.bufferLimit = bufferLimit;
+    }
+
+    /**
+     * Creates a new instance of this consumer with the provided per-response buffer limit and a shared memory budget
+     * that bounds aggregate heap usage across all concurrent responses.
+     *
+     * @param bufferLimit the per-response buffer limit. Must be greater than 0.
+     * @param memoryBudget the shared memory budget; {@code null} is treated as {@link ResponseMemoryBudget#UNLIMITED}.
+     * @throws IllegalArgumentException if {@code bufferLimit} is less than or equal to 0.
+     */
+    public HeapBufferedAsyncResponseConsumer(int bufferLimit, ResponseMemoryBudget memoryBudget) {
+        super(new HeapBufferedAsyncEntityConsumer(bufferLimit, memoryBudget));
         this.bufferLimit = bufferLimit;
     }
 

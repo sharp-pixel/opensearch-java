@@ -35,6 +35,7 @@ package org.opensearch.client.transport.httpclient5;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.nio.AsyncResponseConsumer;
 import org.opensearch.client.transport.httpclient5.internal.HeapBufferedAsyncResponseConsumer;
+import org.opensearch.client.transport.httpclient5.internal.ResponseMemoryBudget;
 
 /**
  * Factory used to create instances of {@link AsyncResponseConsumer}. Each request retry needs its own instance of the
@@ -65,15 +66,36 @@ public interface HttpAsyncResponseConsumerFactory {
         // default buffer limit is 100MB
         static final int DEFAULT_BUFFER_LIMIT = 100 * 1024 * 1024;
 
+        /**
+         * Default total response-buffer budget shared across all consumers; {@code 0} means unlimited, which
+         * preserves the legacy behavior.
+         */
+        static final long DEFAULT_MAX_TOTAL_BUFFER_LIMIT = 0L;
+
         private final int bufferLimit;
+        private final ResponseMemoryBudget memoryBudget;
 
         /**
-         * Creates a {@link HeapBufferedResponseConsumerFactory} instance with the given buffer limit.
+         * Creates a {@link HeapBufferedResponseConsumerFactory} instance with the given buffer limit and no shared
+         * memory budget.
          *
-         * @param bufferLimitBytes the buffer limit to be applied to this instance
+         * @param bufferLimitBytes the per-response buffer limit to be applied to this instance
          */
         public HeapBufferedResponseConsumerFactory(int bufferLimitBytes) {
+            this(bufferLimitBytes, DEFAULT_MAX_TOTAL_BUFFER_LIMIT);
+        }
+
+        /**
+         * Creates a {@link HeapBufferedResponseConsumerFactory} instance with a per-response buffer limit and a total
+         * heap budget shared across every consumer it creates.
+         *
+         * @param bufferLimitBytes the per-response buffer limit
+         * @param maxTotalBufferBytes the total heap budget shared across all concurrent responses; a value
+         *                            {@code <= 0} disables the budget (unlimited)
+         */
+        public HeapBufferedResponseConsumerFactory(int bufferLimitBytes, long maxTotalBufferBytes) {
             this.bufferLimit = bufferLimitBytes;
+            this.memoryBudget = maxTotalBufferBytes > 0 ? new ResponseMemoryBudget(maxTotalBufferBytes) : ResponseMemoryBudget.UNLIMITED;
         }
 
         /**
@@ -81,7 +103,14 @@ public interface HttpAsyncResponseConsumerFactory {
          */
         @Override
         public AsyncResponseConsumer<ClassicHttpResponse> createHttpAsyncResponseConsumer() {
-            return new HeapBufferedAsyncResponseConsumer(bufferLimit);
+            return new HeapBufferedAsyncResponseConsumer(bufferLimit, memoryBudget);
+        }
+
+        /**
+         * @return the shared memory budget applied to all consumers created by this factory
+         */
+        ResponseMemoryBudget getMemoryBudget() {
+            return memoryBudget;
         }
     }
 }

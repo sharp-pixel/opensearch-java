@@ -81,6 +81,8 @@ public class ApacheHttpClient5TransportBuilder {
     private Optional<Boolean> chunkedEnabled;
     private JsonpMapper mapper;
     private TransportOptions options;
+    private Integer responseBufferLimitBytes = null;
+    private Long maxTotalResponseBufferBytes = null;
     private Long reactorRebuildBackoffMillis = null;
 
     /**
@@ -204,6 +206,45 @@ public class ApacheHttpClient5TransportBuilder {
     }
 
     /**
+     * Sets the maximum size, in bytes, of a single response that will be buffered in heap memory. A response larger
+     * than this fails with a recoverable error rather than being buffered, and the transport stays usable.
+     * <p>
+     * Defaults to 100 MB.
+     *
+     * @param responseBufferLimitBytes the per-response heap buffer limit; must be greater than 0
+     * @throws IllegalArgumentException if {@code responseBufferLimitBytes} is less than or equal to 0
+     */
+    public ApacheHttpClient5TransportBuilder setResponseBufferLimitBytes(int responseBufferLimitBytes) {
+        if (responseBufferLimitBytes <= 0) {
+            throw new IllegalArgumentException("responseBufferLimitBytes must be greater than 0");
+        }
+        this.responseBufferLimitBytes = responseBufferLimitBytes;
+        return this;
+    }
+
+    /**
+     * Sets a global budget, in bytes, for response content buffered in heap memory across <strong>all</strong>
+     * concurrent requests. Once the budget is exhausted, further buffering fails fast with a recoverable error,
+     * protecting the client JVM from memory exhaustion under load (for example a request spike or DDoS against an
+     * Internet-facing client). See
+     * <a href="https://github.com/opensearch-project/opensearch-java/issues/1969">opensearch-java#1969</a>.
+     * <p>
+     * A value {@code <= 0} (the default) disables the budget, preserving legacy behavior. When enabling it, pick a
+     * value that comfortably fits the available heap; note that without a budget the theoretical worst case is
+     * {@code maxConnTotal * responseBufferLimit} (with defaults, {@value ApacheHttpClient5TransportBuilder#DEFAULT_MAX_CONN_TOTAL}
+     * x 100 MB).
+     * <p>
+     * Setting this (or {@link #setResponseBufferLimitBytes(int)}) installs a response consumer factory that takes
+     * precedence over any {@link HttpAsyncResponseConsumerFactory} supplied via {@link #setOptions(TransportOptions)}.
+     *
+     * @param maxTotalResponseBufferBytes the total heap budget shared across concurrent responses; {@code <= 0} to disable
+     */
+    public ApacheHttpClient5TransportBuilder setMaxTotalResponseBufferBytes(long maxTotalResponseBufferBytes) {
+        this.maxTotalResponseBufferBytes = maxTotalResponseBufferBytes;
+        return this;
+    }
+
+    /**
      * Sets the base back-off, in milliseconds, between attempts to rebuild the underlying async client after the
      * I/O reactor has been shut down (see
      * <a href="https://github.com/opensearch-project/opensearch-java/issues/1969">opensearch-java#1969</a>). The
@@ -303,12 +344,35 @@ public class ApacheHttpClient5TransportBuilder {
             failureListener = new ApacheHttpClient5Transport.FailureListener();
         }
 
+        // If response buffering is configured, inject a consumer factory carrying the per-response limit and the
+        // shared global memory budget into the (default) transport options. Computed into a local so build() does not
+        // mutate the builder's own configuration (build() stays idempotent).
+        TransportOptions effectiveOptions = options;
+        if (responseBufferLimitBytes != null || maxTotalResponseBufferBytes != null) {
+            final int limit = (responseBufferLimitBytes != null)
+                ? responseBufferLimitBytes
+                : HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory.DEFAULT_BUFFER_LIMIT;
+            final long total = (maxTotalResponseBufferBytes != null)
+                ? maxTotalResponseBufferBytes
+                : HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory.DEFAULT_MAX_TOTAL_BUFFER_LIMIT;
+            final HttpAsyncResponseConsumerFactory consumerFactory =
+                new HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory(limit, total);
+
+            final ApacheHttpClient5Options base = (options == null)
+                ? ApacheHttpClient5Options.initialOptions()
+                : ApacheHttpClient5Options.of(options);
+            final ApacheHttpClient5Options.Builder optionsBuilder = base.toBuilder();
+            optionsBuilder.setHttpAsyncResponseConsumerFactory(consumerFactory);
+            effectiveOptions = optionsBuilder.build();
+        }
+
         final RequestConfigCallback requestConfigCallbackSnapshot = requestConfigCallback;
         final ConnectionConfigCallback connectionConfigCallbackSnapshot = connectionConfigCallback;
         final HttpClientConfigCallback httpClientConfigCallbackSnapshot = httpClientConfigCallback;
 
         // Factory that builds AND starts a fresh async client. It is used for the initial client and to rebuild it if
-        // the I/O reactor is shut down, allowing the transport to recover without being recreated by the caller.
+        // the I/O reactor is shut down (e.g. after an out-of-memory condition under load), allowing the transport to
+        // recover without being recreated by the caller.
         // See https://github.com/opensearch-project/opensearch-java/issues/1969.
         final Supplier<CloseableHttpAsyncClient> clientFactory = () -> {
             final CloseableHttpAsyncClient client = AccessController.doPrivileged(
@@ -340,7 +404,7 @@ public class ApacheHttpClient5TransportBuilder {
                 defaultHeaders,
                 nodes,
                 mapper,
-                options,
+                effectiveOptions,
                 pathPrefix,
                 failureListener,
                 nodeSelector,

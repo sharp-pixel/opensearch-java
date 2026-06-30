@@ -68,6 +68,7 @@ import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.core5.concurrent.FutureCallback;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ConnectionClosedException;
+import org.apache.hc.core5.http.ContentTooLongException;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
@@ -105,6 +106,7 @@ import org.opensearch.client.transport.httpclient5.internal.HttpUriRequestProduc
 import org.opensearch.client.transport.httpclient5.internal.Node;
 import org.opensearch.client.transport.httpclient5.internal.NodeSelector;
 import org.opensearch.client.transport.httpclient5.internal.NodeState;
+import org.opensearch.client.transport.httpclient5.internal.ResponseMemoryBudget;
 import org.opensearch.client.util.MissingRequiredPropertyException;
 
 /**
@@ -138,6 +140,11 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
     // Monotonic nanosecond clock; overridable for deterministic back-off testing.
     private volatile LongSupplier nanoClock = System::nanoTime;
     private final ApacheHttpClient5Options transportOptions;
+    // Budget backing the transport's default response consumer factory, if any; reset on client rebuild so that
+    // reservations held by consumers orphaned by a reactor shutdown cannot leak permanently.
+    @Nullable
+    private final ResponseMemoryBudget responseMemoryBudget;
+    private final ConcurrentMap<ResponseMemoryBudget, Integer> activeResponseMemoryBudgets = new ConcurrentHashMap<>();
     private final ConcurrentMap<HttpHost, DeadHostState> denylist = new ConcurrentHashMap<>();
     private final AtomicInteger lastNodeIndex = new AtomicInteger(0);
     private volatile NodeTuple<List<Node>> nodeTuple;
@@ -181,7 +188,8 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
 
     /**
      * Creates a transport that can rebuild its underlying {@link CloseableHttpAsyncClient} if the I/O reactor is shut
-     * down, so the transport can recover without being recreated by the caller. See
+     * down (for example after an out-of-memory condition under heavy load), so the transport can recover without being
+     * recreated by the caller. See
      * <a href="https://github.com/opensearch-project/opensearch-java/issues/1969">opensearch-java#1969</a>.
      *
      * @param clientFactory factory used to (re)build and start the async client, or {@code null} to disable recovery
@@ -214,6 +222,7 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
         this.defaultHeaders = Collections.unmodifiableList(Arrays.asList(defaultHeaders));
         this.pathPrefix = pathPrefix;
         this.transportOptions = (options == null) ? ApacheHttpClient5Options.initialOptions() : ApacheHttpClient5Options.of(options);
+        this.responseMemoryBudget = extractMemoryBudget(this.transportOptions);
         this.warningsHandler = strictDeprecationMode ? WarningsHandler.STRICT : WarningsHandler.PERMISSIVE;
         this.nodeSelector = (nodeSelector == null) ? NodeSelector.ANY : nodeSelector;
         this.failureListener = (failureListener == null) ? new FailureListener() : failureListener;
@@ -315,6 +324,7 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
     ) {
         final CloseableHttpAsyncClient client;
         final RequestContext context;
+        final ResponseMemoryBudget attemptMemoryBudget;
         rebuildLock.lock();
         try {
             if (closed.get()) {
@@ -323,10 +333,12 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
             }
             client = clientRef.get();
             context = createContextForNextAttempt(options, request, node, nodeTuple.authCache);
+            attemptMemoryBudget = registerResponseMemoryBudget(options);
         } finally {
             rebuildLock.unlock();
         }
         final AtomicBoolean callbackOrDependencyClaimed = new AtomicBoolean(false);
+        final AtomicBoolean attemptMemoryBudgetReleased = new AtomicBoolean(false);
         final FutureCallback<ClassicHttpResponse> callback = new FutureCallback<ClassicHttpResponse>() {
             @Override
             public void completed(ClassicHttpResponse httpResponse) {
@@ -344,6 +356,8 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
                     }
                 } catch (Exception e) {
                     listener.completeExceptionally(e);
+                } finally {
+                    unregisterResponseMemoryBudget(attemptMemoryBudget, attemptMemoryBudgetReleased);
                 }
             }
 
@@ -365,6 +379,13 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
                         );
                         return;
                     }
+                    if (isNonRetryableClientFailure(failure)) {
+                        // Client-side resource exhaustion (response-buffer budget exceeded / OOM) is identical on
+                        // every node. Denylisting nodes and retrying across the cluster would be futile and would
+                        // amplify load under exactly the condition we are shedding, so fail fast instead.
+                        listener.completeExceptionally(failure);
+                        return;
+                    }
                     onFailure(node);
                     if (nodeTuple.nodes.hasNext()) {
                         performRequestAsync(nodeTuple, options, request, warningsHandler, listener);
@@ -373,13 +394,19 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
                     }
                 } catch (Exception e) {
                     listener.completeExceptionally(e);
+                } finally {
+                    unregisterResponseMemoryBudget(attemptMemoryBudget, attemptMemoryBudgetReleased);
                 }
             }
 
             @Override
             public void cancelled() {
                 callbackOrDependencyClaimed.set(true);
-                listener.completeExceptionally(new CancellationException("request was cancelled"));
+                try {
+                    listener.completeExceptionally(new CancellationException("request was cancelled"));
+                } finally {
+                    unregisterResponseMemoryBudget(attemptMemoryBudget, attemptMemoryBudgetReleased);
+                }
             }
         };
 
@@ -387,10 +414,27 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
         try {
             future = client.execute(context.requestProducer, context.asyncResponseConsumer, context.context, callback);
         } catch (final IOReactorShutdownException reactorShutdown) {
-            // The I/O reactor has been shut down. Try to recover by rebuilding the client, then retry this request once
-            // on the fresh client.
-            retryAfterReactorShutdown(nodeTuple, options, request, warningsHandler, listener, node, client, reactorShutdown, allowRecovery);
+            // The I/O reactor has been shut down (typically the aftermath of an Error such as OOM on a reactor thread).
+            // Try to recover by rebuilding the client, then retry this request once on the fresh client.
+            try {
+                retryAfterReactorShutdown(
+                    nodeTuple,
+                    options,
+                    request,
+                    warningsHandler,
+                    listener,
+                    node,
+                    client,
+                    reactorShutdown,
+                    allowRecovery
+                );
+            } finally {
+                unregisterResponseMemoryBudget(attemptMemoryBudget, attemptMemoryBudgetReleased);
+            }
             return;
+        } catch (final RuntimeException | Error failure) {
+            unregisterResponseMemoryBudget(attemptMemoryBudget, attemptMemoryBudgetReleased);
+            throw failure;
         }
 
         if (callbackOrDependencyClaimed.compareAndSet(false, true) && future instanceof org.apache.hc.core5.concurrent.Cancellable) {
@@ -431,8 +475,8 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
      * Attempts to recover from an {@link IOReactorShutdownException} by rebuilding the underlying async client.
      * <p>
      * Recovery is guarded by a circuit breaker based on {@link #DEFAULT_REBUILD_BACKOFF_MILLIS} so that a reactor which
-     * keeps dying under a repeated failure condition does not trigger a rebuild storm that would amplify the failure.
-     * Only one thread rebuilds at a time; concurrent callers that observe the already-rebuilt client reuse it.
+     * keeps dying (for example under sustained memory pressure) does not trigger a rebuild storm that would amplify the
+     * failure. Only one thread rebuilds at a time; concurrent callers that observe the already-rebuilt client reuse it.
      *
      * @param deadClient the client whose reactor was detected as shut down
      * @return a healthy client to retry with, or {@code null} if recovery is disabled, throttled, or itself failed
@@ -474,6 +518,7 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
             lastRebuildNanos = now;
 
             rebuilt = clientFactory.get();
+            resetResponseMemoryBudgets();
             clientRef.set(rebuilt);
             logger.warn("Apache HttpClient 5 I/O reactor was shut down; the transport client has been rebuilt to recover");
         } catch (final RuntimeException rebuildFailure) {
@@ -496,6 +541,40 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
         }
     }
 
+    @Nullable
+    private ResponseMemoryBudget registerResponseMemoryBudget(final ApacheHttpClient5Options options) {
+        final ResponseMemoryBudget budget = extractMemoryBudget(options);
+        if (budget == null || !budget.isLimited()) {
+            return null;
+        }
+        activeResponseMemoryBudgets.compute(budget, (ignored, count) -> count == null ? 1 : count + 1);
+        return budget;
+    }
+
+    private void unregisterResponseMemoryBudget(
+        @Nullable final ResponseMemoryBudget budget,
+        final AtomicBoolean attemptMemoryBudgetReleased
+    ) {
+        if (budget == null || !attemptMemoryBudgetReleased.compareAndSet(false, true)) {
+            return;
+        }
+        activeResponseMemoryBudgets.computeIfPresent(budget, (ignored, count) -> count <= 1 ? null : count - 1);
+    }
+
+    private void resetResponseMemoryBudgets() {
+        // Consumers that were buffering on the dead client are orphaned and never release their reservations. Reset the
+        // transport default budget and any finite request-specific budgets that are active on the dead client before the
+        // rebuilt client is published, so stale releases cannot affect new-generation consumers.
+        final Set<ResponseMemoryBudget> budgets = new HashSet<>();
+        if (responseMemoryBudget != null && responseMemoryBudget.isLimited()) {
+            budgets.add(responseMemoryBudget);
+        }
+        budgets.addAll(activeResponseMemoryBudgets.keySet());
+        for (ResponseMemoryBudget budget : budgets) {
+            budget.reset();
+        }
+    }
+
     /**
      * Overrides the monotonic clock used to time rebuild back-off. For tests only.
      *
@@ -503,6 +582,44 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
      */
     void setNanoClock(final LongSupplier nanoClock) {
         this.nanoClock = nanoClock;
+    }
+
+    /**
+     * Extracts the shared response-buffer budget backing the transport's default consumer factory, if any, so it can
+     * be reset when the client is rebuilt. Returns {@code null} when no budget-aware factory is configured.
+     *
+     * @param options the resolved transport options
+     * @return the shared {@link ResponseMemoryBudget}, or {@code null}
+     */
+    @Nullable
+    private static ResponseMemoryBudget extractMemoryBudget(final ApacheHttpClient5Options options) {
+        final HttpAsyncResponseConsumerFactory factory = options.getHttpAsyncResponseConsumerFactory();
+        if (factory instanceof HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory) {
+            return ((HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory) factory).getMemoryBudget();
+        }
+        return null;
+    }
+
+    /**
+     * Identifies failures caused by client-side resource exhaustion rather than a node/network problem. Such failures
+     * are identical regardless of which node serves the request, so they must not denylist a node or trigger a
+     * cross-node retry: doing so would be futile and would amplify load under the very condition (overload / OOM)
+     * that produced the failure.
+     *
+     * @param failure the failure reported to the request callback
+     * @return {@code true} if the failure is a client-side resource condition that should fail fast
+     */
+    private static boolean isNonRetryableClientFailure(final Throwable failure) {
+        Throwable cause = failure;
+        // Bounded walk of the cause chain, defensive against pathological or cyclic chains.
+        for (int depth = 0; cause != null && depth < 32; cause = cause.getCause(), depth++) {
+            if (cause instanceof ResponseBufferBudgetExceededException
+                || cause instanceof ContentTooLongException
+                || cause instanceof OutOfMemoryError) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isReactorShutdown(final Throwable failure) {
@@ -1387,6 +1504,11 @@ public class ApacheHttpClient5Transport implements OpenSearchTransport {
                 // We are not able to reconstruct the response, throw IOException instead
                 return new IOException(exception.getMessage(), exception);
             }
+        }
+        if (exception instanceof ResponseBufferBudgetExceededException) {
+            ResponseBufferBudgetExceededException e = new ResponseBufferBudgetExceededException(exception.getMessage());
+            e.initCause(exception);
+            return e;
         }
         if (exception instanceof IOException) {
             return new IOException(exception.getMessage(), exception);

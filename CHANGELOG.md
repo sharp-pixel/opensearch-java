@@ -22,6 +22,7 @@ Inspired from [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 - Added `equals()` and `hashCode()` implementations to `FieldValue` ([#1998](https://github.com/opensearch-project/opensearch-java/pull/1998))
 - Add document lifecycle guide and runnable sample ([#2017](https://github.com/opensearch-project/opensearch-java/pull/2017))
 - Add configurable I/O reactor rebuild back-off to `ApacheHttpClient5Transport` ([#1969](https://github.com/opensearch-project/opensearch-java/issues/1969))
+- Add response-buffer memory budget and backpressure to `ApacheHttpClient5Transport` ([#1969](https://github.com/opensearch-project/opensearch-java/issues/1969))
 
 ### Fixed
 - Recover `ApacheHttpClient5Transport` from an I/O reactor shutdown instead of failing every subsequent request permanently ([#1969](https://github.com/opensearch-project/opensearch-java/issues/1969))

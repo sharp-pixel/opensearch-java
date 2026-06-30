@@ -14,6 +14,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -23,6 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
 import org.apache.hc.core5.concurrent.FutureCallback;
+import org.apache.hc.core5.http.ConnectionClosedException;
+import org.apache.hc.core5.http.ContentTooLongException;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.message.BasicClassicHttpResponse;
@@ -37,16 +40,21 @@ import org.apache.hc.core5.reactor.IOReactorStatus;
 import org.apache.hc.core5.util.TimeValue;
 import org.junit.Test;
 import org.opensearch.client.json.jackson3.JacksonJsonpMapper;
+import org.opensearch.client.transport.TransportOptions;
 import org.opensearch.client.transport.endpoints.BooleanEndpoint;
 import org.opensearch.client.transport.endpoints.BooleanResponse;
 import org.opensearch.client.transport.httpclient5.internal.Node;
+import org.opensearch.client.transport.httpclient5.internal.NodeState;
+import org.opensearch.client.transport.httpclient5.internal.ResponseMemoryBudget;
 
 /**
- * Unit tests for the self-healing recovery of {@link ApacheHttpClient5Transport} (see opensearch-java#1969).
+ * Unit tests for the self-healing recovery and client-side failure handling of {@link ApacheHttpClient5Transport}
+ * (see opensearch-java#1969).
  */
 public class ApacheHttpClient5TransportRecoveryTest {
 
     private static final HttpHost HOST_A = new HttpHost("localhost", 9200);
+    private static final HttpHost HOST_B = new HttpHost("localhost", 9201);
 
     // --- Reactor recovery -----------------------------------------------------------------------------------------
 
@@ -186,6 +194,109 @@ public class ApacheHttpClient5TransportRecoveryTest {
         assertEquals(3, factoryCalls.get());
     }
 
+    // --- Client-side failure classification (A1) ------------------------------------------------------------------
+
+    @Test
+    public void testBudgetExceededIsNotRetriedAndDoesNotDenylist() {
+        FakeAsyncClient client = new FakeAsyncClient(false, new ResponseBufferBudgetExceededException("budget exceeded"));
+        ApacheHttpClient5Transport transport = newTransport(null, client, 60_000L, Arrays.asList(new Node(HOST_A), new Node(HOST_B)));
+
+        assertThrows(ResponseBufferBudgetExceededException.class, () -> transport.performRequest(null, headEndpoint(), null));
+
+        // A client-side budget rejection must fail fast: no cross-node retry, no node denylisted.
+        assertEquals("budget rejection must not be retried across nodes", 1, client.executeCount.get());
+        assertTrue("no node should be denylisted", transport.getNodes().values().stream().allMatch(s -> s == NodeState.Active));
+    }
+
+    @Test
+    public void testContentTooLongIsNotRetriedAndDoesNotDenylist() {
+        FakeAsyncClient client = new FakeAsyncClient(false, new ContentTooLongException("response too large"));
+        ApacheHttpClient5Transport transport = newTransport(null, client, 60_000L, Arrays.asList(new Node(HOST_A), new Node(HOST_B)));
+
+        IOException ex = assertThrows(IOException.class, () -> transport.performRequest(null, headEndpoint(), null));
+
+        assertTrue("oversized response should be preserved as the root cause", ex.getCause() instanceof ContentTooLongException);
+        assertEquals("oversized response must not be retried across nodes", 1, client.executeCount.get());
+        assertTrue("no node should be denylisted", transport.getNodes().values().stream().allMatch(s -> s == NodeState.Active));
+    }
+
+    @Test
+    public void testOutOfMemoryFailureIsNotRetriedAndDoesNotDenylist() {
+        FakeAsyncClient client = new FakeAsyncClient(false, new IOException("ran out of memory buffering", new OutOfMemoryError("heap")));
+        ApacheHttpClient5Transport transport = newTransport(null, client, 60_000L, Arrays.asList(new Node(HOST_A), new Node(HOST_B)));
+
+        assertThrows(IOException.class, () -> transport.performRequest(null, headEndpoint(), null));
+
+        assertEquals("OOM-caused failure must not be retried across nodes", 1, client.executeCount.get());
+        assertTrue("no node should be denylisted", transport.getNodes().values().stream().allMatch(s -> s == NodeState.Active));
+    }
+
+    @Test
+    public void testNetworkFailureIsRetriedAcrossNodes() {
+        // Contrast: a genuine network failure SHOULD be retried on the next node and denylist the failed one.
+        FakeAsyncClient client = new FakeAsyncClient(false, new ConnectionClosedException("connection reset"));
+        ApacheHttpClient5Transport transport = newTransport(null, client, 60_000L, Arrays.asList(new Node(HOST_A), new Node(HOST_B)));
+
+        assertThrows(IOException.class, () -> transport.performRequest(null, headEndpoint(), null));
+
+        assertEquals("network failure should be retried on the next node", 2, client.executeCount.get());
+        assertTrue(
+            "a node should be denylisted after a network failure",
+            transport.getNodes().values().stream().anyMatch(s -> s == NodeState.Unavailable)
+        );
+    }
+
+    @Test
+    public void testRecoveryResetsLeakedBudget() throws IOException {
+        // A budget-aware factory whose budget has "leaked" reservations: this simulates consumers that were buffering
+        // on the reactor when it died and were orphaned without ever releasing their reservations.
+        HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory factory =
+            new HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory(100 * 1024 * 1024, 1_000_000L);
+        ResponseMemoryBudget budget = factory.getMemoryBudget();
+        assertTrue(budget.tryReserve(500_000));
+        assertEquals(500_000L, budget.usedBytes());
+
+        ApacheHttpClient5Options.Builder optionsBuilder = ApacheHttpClient5Options.DEFAULT.toBuilder();
+        optionsBuilder.setHttpAsyncResponseConsumerFactory(factory);
+        ApacheHttpClient5Options options = optionsBuilder.build();
+
+        FakeAsyncClient dead = new FakeAsyncClient(true);
+        FakeAsyncClient healthy = new FakeAsyncClient(false);
+        Supplier<CloseableHttpAsyncClient> f = () -> healthy;
+        ApacheHttpClient5Transport transport = newTransport(f, dead, 60_000L, Collections.singletonList(new Node(HOST_A)), options);
+
+        // Triggering recovery (rebuild) must clear the orphaned reservations so the budget cannot leak into permanent
+        // rejection of future requests.
+        BooleanResponse response = transport.performRequest(null, headEndpoint(), null);
+
+        assertTrue("request should succeed after recovery", response.value());
+        assertEquals("budget must be reset on client rebuild", 0L, budget.usedBytes());
+    }
+
+    @Test
+    public void testRecoveryResetsRequestSpecificBudget() throws IOException {
+        // Request-specific options can carry their own budget-aware consumer factory. Those budgets must be reset too;
+        // otherwise a reactor shutdown can leave a reused request-options instance permanently exhausted.
+        HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory factory =
+            new HttpAsyncResponseConsumerFactory.HeapBufferedResponseConsumerFactory(100 * 1024 * 1024, 1_000_000L);
+        ResponseMemoryBudget budget = factory.getMemoryBudget();
+        assertTrue(budget.tryReserve(500_000));
+        assertEquals(500_000L, budget.usedBytes());
+
+        ApacheHttpClient5Options.Builder optionsBuilder = ApacheHttpClient5Options.DEFAULT.toBuilder();
+        optionsBuilder.setHttpAsyncResponseConsumerFactory(factory);
+        ApacheHttpClient5Options requestOptions = optionsBuilder.build();
+
+        FakeAsyncClient dead = new FakeAsyncClient(true);
+        FakeAsyncClient healthy = new FakeAsyncClient(false);
+        ApacheHttpClient5Transport transport = newTransport(() -> healthy, dead);
+
+        BooleanResponse response = transport.performRequest(null, headEndpoint(), requestOptions);
+
+        assertTrue("request should succeed after recovery", response.value());
+        assertEquals("request-specific budget must be reset on client rebuild", 0L, budget.usedBytes());
+    }
+
     // --- helpers --------------------------------------------------------------------------------------------------
 
     private static ApacheHttpClient5Transport newTransport(Supplier<CloseableHttpAsyncClient> factory, CloseableHttpAsyncClient initial) {
@@ -198,6 +309,16 @@ public class ApacheHttpClient5TransportRecoveryTest {
         long backoffMillis,
         List<Node> nodes
     ) {
+        return newTransport(factory, initial, backoffMillis, nodes, null);
+    }
+
+    private static ApacheHttpClient5Transport newTransport(
+        Supplier<CloseableHttpAsyncClient> factory,
+        CloseableHttpAsyncClient initial,
+        long backoffMillis,
+        List<Node> nodes,
+        TransportOptions options
+    ) {
         return new ApacheHttpClient5Transport(
             factory,
             backoffMillis,
@@ -205,7 +326,7 @@ public class ApacheHttpClient5TransportRecoveryTest {
             new Header[0],
             nodes,
             new JacksonJsonpMapper(),
-            null,
+            options,
             null,
             null,
             null,
@@ -222,26 +343,33 @@ public class ApacheHttpClient5TransportRecoveryTest {
     /**
      * Minimal {@link CloseableHttpAsyncClient}. When {@code reactorDown} is set, {@code doExecute} throws
      * {@link IOReactorShutdownException}; when {@code reactorDownViaCallback} is set, it reports the same shutdown to
-     * the callback, matching the path used by the real HC5 client when scheduling catches the shutdown. Otherwise it
-     * completes with an empty {@code 200} response.
+     * the callback, matching the path used by the real HC5 client when scheduling catches the shutdown. When
+     * {@code failWith} is set, it reports that failure to the callback. Otherwise it completes with an empty
+     * {@code 200} response.
      */
     private static final class FakeAsyncClient extends CloseableHttpAsyncClient {
         private final boolean reactorDown;
         private final boolean reactorDownViaCallback;
+        private final Exception failWith;
         final AtomicInteger executeCount = new AtomicInteger();
         volatile boolean closed = false;
 
         FakeAsyncClient(boolean reactorDown) {
-            this(reactorDown, false);
+            this(reactorDown, null);
         }
 
-        private FakeAsyncClient(boolean reactorDown, boolean reactorDownViaCallback) {
+        FakeAsyncClient(boolean reactorDown, Exception failWith) {
+            this(reactorDown, false, failWith);
+        }
+
+        private FakeAsyncClient(boolean reactorDown, boolean reactorDownViaCallback, Exception failWith) {
             this.reactorDown = reactorDown;
             this.reactorDownViaCallback = reactorDownViaCallback;
+            this.failWith = failWith;
         }
 
         static FakeAsyncClient reactorShutdownViaCallback() {
-            return new FakeAsyncClient(true, true);
+            return new FakeAsyncClient(true, true, null);
         }
 
         @Override
@@ -263,6 +391,12 @@ public class ApacheHttpClient5TransportRecoveryTest {
                     return CompletableFuture.completedFuture(null);
                 }
                 throw shutdown;
+            }
+            if (failWith != null) {
+                if (callback != null) {
+                    callback.failed(failWith);
+                }
+                return CompletableFuture.completedFuture(null);
             }
             @SuppressWarnings("unchecked")
             T response = (T) new BasicClassicHttpResponse(200);
